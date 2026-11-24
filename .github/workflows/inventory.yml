@@ -1,0 +1,58 @@
+name: Soundtrack inventory
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install analysis tools
+        run: sudo apt-get update -qq && sudo apt-get install -y rclone ffmpeg
+      - name: Analyze archive without modifying audio
+        env:
+          RCLONE_CONFIG_DRIVE_TYPE: drive
+          RCLONE_CONFIG_DRIVE_SCOPE: drive
+          RCLONE_CONFIG_DRIVE_TOKEN: ${{ secrets.DRIVE_TOKEN }}
+          RCLONE_CONFIG_DRIVE_CLIENT_ID: ${{ secrets.DRIVE_CLIENT_ID }}
+          RCLONE_CONFIG_DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
+          SOURCE: ${{ secrets.DRIVE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          rclone copyto "drive:$SOURCE" "$work/source.zip" >"$work/private.log" 2>&1 || { echo "::error::Download failed"; exit 1; }
+          test "$(stat -c %s "$work/source.zip")" = 959453558
+          echo "Archive downloaded. Analyzing."
+          python3 - "$work" <<'PY'
+          import sys, zipfile, pathlib, subprocess, json, re, shutil, concurrent.futures
+          root=pathlib.Path(sys.argv[1])
+          def analyze(pair):
+              i, member=pair
+              p=root/("track-%06d.flac"%i)
+              try:
+                  with zipfile.ZipFile(root/"source.zip") as z, z.open(member) as src, p.open("wb") as dst:
+                      shutil.copyfileobj(src,dst)
+                  probe=subprocess.run(["ffprobe","-v","error","-show_format","-show_streams","-of","json",str(p)],capture_output=True,text=True,check=True)
+                  info=json.loads(probe.stdout)
+                  loud=subprocess.run(["ffmpeg","-nostdin","-hide_banner","-nostats","-i",str(p),"-map","0:a:0","-af","loudnorm=I=-16:TP=-1:LRA=11:print_format=json","-f","null","-"],capture_output=True,text=True,check=True)
+                  measured=json.loads(re.findall(r'\{\s*"input_i".*?\}',loud.stderr,re.S)[-1])
+                  info["format"].pop("filename",None)
+                  return {"path":member.filename,"bytes":member.file_size,"crc32":format(member.CRC,"08x"),"probe":info,"loudness":measured}
+              finally:
+                  p.unlink(missing_ok=True)
+          with zipfile.ZipFile(root/"source.zip") as z:
+              members=z.infolist()
+              tracks=[m for m in members if not m.is_dir() and m.filename.lower().endswith(".flac")]
+              other=[m.filename for m in members if not m.is_dir() and not m.filename.lower().endswith(".flac")]
+          if not tracks: raise SystemExit("No FLAC tracks")
+          with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+              results=list(pool.map(analyze,enumerate(tracks)))
+          (root/"inventory.json").write_text(json.dumps({"tracks":results,"other_files":other},ensure_ascii=False,indent=2),encoding="utf-8")
+          print("Analyzed",len(results),"FLAC tracks")
+          PY
+          rclone copyto "$work/inventory.json" "drive:Soundtrack-Processor-Tests/inventory-${GITHUB_RUN_ID}.json" --immutable >"$work/private.log" 2>&1 || { echo "::error::Report upload failed"; exit 1; }
+          echo "Inventory uploaded privately to Google Drive."
