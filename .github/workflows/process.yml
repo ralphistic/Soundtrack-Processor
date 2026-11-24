@@ -1,0 +1,123 @@
+name: Verified soundtrack processing
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/process.yml"]
+permissions:
+  contents: read
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Prepare tools
+        run: |
+          command -v ffmpeg && command -v rclone || { sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update -qq && sudo apt-get -y install ffmpeg rclone; }
+          python3 -m venv /tmp/audioenv
+          /tmp/audioenv/bin/pip -q install numpy soundfile mutagen
+      - name: Process and verify privately
+        env:
+          RCLONE_CONFIG_DRIVE_TYPE: drive
+          RCLONE_CONFIG_DRIVE_SCOPE: drive
+          RCLONE_CONFIG_DRIVE_TOKEN: ${{ secrets.DRIVE_TOKEN }}
+          RCLONE_CONFIG_DRIVE_CLIENT_ID: ${{ secrets.DRIVE_CLIENT_ID }}
+          RCLONE_CONFIG_DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
+          SOURCE: ${{ secrets.DRIVE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          rclone copyto "drive:$SOURCE" "$work/source.zip" >"$work/private.log" 2>&1
+          test "$(stat -c %s "$work/source.zip")" = 959453558
+          rclone copyto "drive:Soundtrack-Processor-Tests/inventory-45305903809-1.json" "$work/inventory.json" >"$work/private.log" 2>&1
+          /tmp/audioenv/bin/python - "$work" <<'PY'
+          import sys, pathlib, zipfile, json, math, re, subprocess, shutil, collections
+          import numpy as np
+          import soundfile as sf
+          from mutagen.flac import FLAC
+          root=pathlib.Path(sys.argv[1])
+          def measure(p):
+              r=subprocess.run(["ffmpeg","-nostdin","-hide_banner","-nostats","-xerror","-i",str(p),"-map","0:a:0","-af","loudnorm=I=-16:TP=-1:LRA=11:print_format=json","-f","null","-"],capture_output=True,text=True,check=True)
+              j=json.loads(re.findall(r'\{\s*"input_i".*?\}',r.stderr,re.S)[-1])
+              return float(j["input_i"]),float(j["input_tp"])
+          def render(src,dst,gain):
+              original=FLAC(src)
+              bits=original.info.bits_per_sample
+              assert bits in (16,24)
+              shift=32-bits
+              scale=10**(gain/20)
+              lo,hi=-(2**(bits-1)),2**(bits-1)-1
+              with sf.SoundFile(src) as a, sf.SoundFile(dst,"w",samplerate=a.samplerate,channels=a.channels,format="FLAC",subtype="PCM_"+str(bits)) as b:
+                  for block in a.blocks(blocksize=65536,dtype="int32",always_2d=True):
+                      q=np.rint((block.astype(np.int64)>>shift)*scale).astype(np.int64)
+                      assert q.min()>=lo and q.max()<=hi
+                      b.write((q<<shift).astype(np.int32))
+              out=FLAC(dst)
+              out.delete()
+              out=FLAC(dst)
+              for k,v in original.tags.items(): out[k]=v
+              out["albumartist"]="Various Artists"
+              for pic in original.pictures: out.add_picture(pic)
+              out.save()
+              out=FLAC(dst)
+              assert out.pictures==original.pictures
+              expected=dict(original.tags)
+              expected["albumartist"]=["Various Artists"]
+              assert dict(out.tags)==expected
+              assert (out.info.sample_rate,out.info.channels,out.info.bits_per_sample,out.info.total_samples)==(original.info.sample_rate,original.info.channels,bits,original.info.total_samples)
+              with sf.SoundFile(src) as a,sf.SoundFile(dst) as b:
+                  for block in a.blocks(blocksize=65536,dtype="int32",always_2d=True):
+                      expected=(np.rint((block.astype(np.int64)>>shift)*scale).astype(np.int64)<<shift).astype(np.int32)
+                      assert np.array_equal(expected,b.read(len(block),dtype="int32",always_2d=True))
+                  assert len(b.read(1))==0
+          # Synthetic regression test exercises both bit depths and exact sample checks.
+          for bits in (16,24):
+              a=root/"test.flac"; b=root/"test-out.flac"
+              sf.write(a,np.tile(np.array([[-0.5,0.25],[0.1,-0.1],[0,0]]),(1000,1)),44100,subtype="PCM_"+str(bits))
+              t=FLAC(a); t["title"]="test"; t.save()
+              render(a,b,-3.25)
+              render(a,b,2.0)
+          print("Synthetic gain and metadata checks passed",flush=True)
+          inv=json.loads((root/"inventory.json").read_text())
+          tracks={x["path"]:x for x in inv["tracks"] if "error" not in x}
+          assert len(tracks)==81
+          report=[]
+          with zipfile.ZipFile(root/"source.zip") as z,zipfile.ZipFile(root/"output.zip","w",compression=zipfile.ZIP_STORED,allowZip64=True) as outzip:
+              members=[m for m in z.infolist() if not m.is_dir() and m.filename.lower().endswith(".flac") and "__MACOSX" not in pathlib.PurePosixPath(m.filename).parts and not pathlib.PurePosixPath(m.filename).name.startswith("._")]
+              assert len(members)==81 and set(m.filename for m in members)==set(tracks)
+              for i,m in enumerate(members):
+                  try:
+                      entry=tracks[m.filename]
+                      assert format(m.CRC,"08x")==entry["crc32"] and m.file_size==entry["bytes"]
+                      src=root/"input.flac"; dst=root/"output.flac"
+                      with z.open(m) as f,src.open("wb") as g: shutil.copyfileobj(f,g)
+                      l,p=map(float,(entry["loudness"]["input_i"],entry["loudness"]["input_tp"]))
+                      assert math.isfinite(l) and math.isfinite(p)
+                      gain=min(-16-l,-1.05-p)
+                      render(src,dst,gain)
+                      actual,peak=measure(dst)
+                      if peak>-1:
+                          gain-=peak+1.05
+                          render(src,dst,gain)
+                          actual,peak=measure(dst)
+                      assert peak<=-1 and abs(actual-(l+gain))<=0.5
+                      outzip.write(dst,m.filename)
+                      report.append(dict(path=m.filename,input_lufs=l,input_peak=p,gain_db=gain,output_lufs=actual,output_peak=peak))
+                      if (i+1)%10==0 or i==80: print("Verified",i+1,"of 81",flush=True)
+                  except Exception as e:
+                      print("Verification failed at track index",i+1,type(e).__name__,flush=True)
+                      raise SystemExit(1) from None
+          with zipfile.ZipFile(root/"output.zip") as z:
+              assert len(z.infolist())==81 and z.testzip() is None
+          (root/"verification.json").write_text(json.dumps(report,indent=2))
+          print("All 81 tracks and output ZIP verified",flush=True)
+          PY
+          dest="Soundtrack-Processor-Tests/processed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rclone copyto "$work/verification.json" "drive:$dest/verification.json" --immutable >"$work/private.log" 2>&1
+          rclone copyto "$work/output.zip" "drive:$dest/Rhythm Heaven - Volume Matched.zip" --immutable >"$work/private.log" 2>&1
+          rclone copyto "drive:$dest/Rhythm Heaven - Volume Matched.zip" "$work/roundtrip.zip" >"$work/private.log" 2>&1
+          cmp "$work/output.zip" "$work/roundtrip.zip"
+          echo "PASS: verified archive uploaded and round-trip bytes match."
