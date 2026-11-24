@@ -30,6 +30,8 @@ jobs:
           umask 077
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
+          rclone about drive: --json >"$work/quota.json" 2>"$work/private.log"
+          python3 -c 'import json,sys; q=json.load(open(sys.argv[1])); free=q.get("free"); print("Available storage bytes:",free); sys.exit(0 if free is not None and free>=1200000000 else 1)' "$work/quota.json"
           rclone copyto "drive:$SOURCE" "$work/source.zip" >"$work/private.log" 2>&1
           test "$(stat -c %s "$work/source.zip")" = 959453558
           rclone copyto "drive:Soundtrack-Processor-Tests/inventory-45305903809-1.json" "$work/inventory.json" >"$work/private.log" 2>&1
