@@ -1,6 +1,9 @@
 name: Soundtrack inventory
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/inventory.yml"]
 permissions:
   contents: read
 jobs:
@@ -38,10 +41,15 @@ jobs:
                       shutil.copyfileobj(src,dst)
                   probe=subprocess.run(["ffprobe","-v","error","-show_format","-show_streams","-of","json",str(p)],capture_output=True,text=True,check=True)
                   info=json.loads(probe.stdout)
-                  loud=subprocess.run(["ffmpeg","-nostdin","-hide_banner","-nostats","-i",str(p),"-map","0:a:0","-af","loudnorm=I=-16:TP=-1:LRA=11:print_format=json","-f","null","-"],capture_output=True,text=True,check=True)
+                  loud=subprocess.run(["ffmpeg","-nostdin","-hide_banner","-nostats","-i",str(p),"-map","0:a:0","-af","loudnorm=I=-16:TP=-1:LRA=11:print_format=json","-f","null","-"],capture_output=True,text=True)
+                  if loud.returncode:
+                      return {"path":member.filename,"probe":info,"error":"ffmpeg failed","returncode":loud.returncode,"diagnostics":loud.stderr}
+
                   measured=json.loads(re.findall(r'\{\s*"input_i".*?\}',loud.stderr,re.S)[-1])
                   info["format"].pop("filename",None)
                   return {"path":member.filename,"bytes":member.file_size,"crc32":format(member.CRC,"08x"),"probe":info,"loudness":measured}
+              except Exception as exc:
+                  return {"path":member.filename,"error":type(exc).__name__,"diagnostics":str(exc)}
               finally:
                   p.unlink(missing_ok=True)
           with zipfile.ZipFile(root/"source.zip") as z:
@@ -52,7 +60,7 @@ jobs:
           with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
               results=list(pool.map(analyze,enumerate(tracks)))
           (root/"inventory.json").write_text(json.dumps({"tracks":results,"other_files":other},ensure_ascii=False,indent=2),encoding="utf-8")
-          print("Analyzed",len(results),"FLAC tracks")
+          print("Inventory entries:",len(results),"errors:",sum("error" in x for x in results))
           PY
-          rclone copyto "$work/inventory.json" "drive:Soundtrack-Processor-Tests/inventory-${GITHUB_RUN_ID}.json" --immutable >"$work/private.log" 2>&1 || { echo "::error::Report upload failed"; exit 1; }
+          rclone copyto "$work/inventory.json" "drive:Soundtrack-Processor-Tests/inventory-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" --immutable >"$work/private.log" 2>&1 || { echo "::error::Report upload failed"; exit 1; }
           echo "Inventory uploaded privately to Google Drive."
