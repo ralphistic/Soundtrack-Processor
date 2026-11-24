@@ -9,7 +9,7 @@ permissions:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Prepare tools
         run: |
@@ -116,8 +116,33 @@ jobs:
           print("All 81 tracks and output ZIP verified",flush=True)
           PY
           dest="Soundtrack-Processor-Tests/processed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          rclone copyto "$work/verification.json" "drive:$dest/verification.json" --immutable >"$work/private.log" 2>&1
-          rclone copyto "$work/output.zip" "drive:$dest/Rhythm Heaven - Volume Matched.zip" --immutable >"$work/private.log" 2>&1
-          rclone copyto "drive:$dest/Rhythm Heaven - Volume Matched.zip" "$work/roundtrip.zip" >"$work/private.log" 2>&1
-          cmp "$work/output.zip" "$work/roundtrip.zip"
-          echo "PASS: verified archive uploaded and round-trip bytes match."
+          log="$work/delivery.log"
+          flags=(--retries 3 --low-level-retries 10 --retries-sleep 5s --drive-chunk-size 32M --contimeout 20s --timeout 90s)
+          transfer() { rclone copyto "$1" "$2" "${flags[@]}" >>"$log" 2>&1; }
+          diagnostics() {
+            transfer "$log" "drive:$dest/delivery-diagnostics.log" || true
+          }
+          # Keep diagnostics private; never publish soundtrack data as Actions artifacts.
+          transfer "$work/verification.json" "drive:$dest/verification.json" || { diagnostics; echo "::error::Report delivery failed"; exit 1; }
+          sha256sum "$work/output.zip" | cut -d' ' -f1 >"$work/archive.sha256"
+          transfer "$work/archive.sha256" "drive:$dest/archive.sha256" || { diagnostics; exit 1; }
+          target="drive:$dest/Rhythm Heaven - Volume Matched.zip"
+          if transfer "$work/output.zip" "$target" && transfer "$target" "$work/roundtrip.zip" && cmp -s "$work/output.zip" "$work/roundtrip.zip"; then
+            echo "PASS: verified archive uploaded and round-trip bytes match."
+            exit 0
+          fi
+          echo "Full archive delivery failed; attempting private recovery checkpoints."
+          diagnostics
+          mkdir "$work/chunks"
+          split -b 64M -d -a 3 "$work/output.zip" "$work/chunks/part-"
+          (cd "$work/chunks" && sha256sum part-* >manifest.sha256)
+          for part in "$work"/chunks/part-*; do
+            name="$(basename "$part")"
+            transfer "$part" "drive:$dest/recovery/$name" || { diagnostics; echo "::error::Recovery chunk upload failed"; exit 1; }
+            transfer "drive:$dest/recovery/$name" "$work/check.part" || { diagnostics; exit 1; }
+            cmp -s "$part" "$work/check.part" || { diagnostics; exit 1; }
+          done
+          transfer "$work/chunks/manifest.sha256" "drive:$dest/recovery/manifest.sha256" || { diagnostics; exit 1; }
+          diagnostics
+          echo "PASS: all recovery chunks uploaded and byte-verified; full ZIP delivery remains unresolved."
+          exit 1
